@@ -111,17 +111,28 @@ The SSID list is stored in flash (not RAM), so it can be as large as your flash 
 
 ### 3. Flash
 
+**One-liner (macOS / Linux)**
+
+```bash
+bash flash.sh
+# or with explicit port:
+bash flash.sh /dev/cu.usbmodem2101
+```
+
+The script installs `arduino-cli` if needed, installs the ESP32 core on first run (~200 MB, once), then compiles and flashes.
+
 **Arduino IDE**
 1. Open `ghost_device.ino`
-2. **Tools → Board** → select your ESP32 variant
-3. **Tools → Port** → select your device
+2. **Tools → Board → ESP32 Arduino → ESP32S3 Dev Module**
+3. **Tools → Flash Size → 4MB**  |  **Tools → Port** → select your device
 4. Upload
 
-**arduino-cli**
+**arduino-cli manually**
 ```bash
-# ESP32-S3
-arduino-cli compile --fqbn esp32:esp32:esp32s3 ghost_device/
-arduino-cli upload  --fqbn esp32:esp32:esp32s3 --port /dev/cu.usbmodem* ghost_device/
+# ESP32-S3 (primary target — tested on ESP32-S3FH4R2)
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=4M,PartitionScheme=default" ghost_device/
+arduino-cli upload  --fqbn "esp32:esp32:esp32s3:FlashSize=4M,PartitionScheme=default" \
+                    --port /dev/cu.usbmodem* ghost_device/
 
 # ESP32 original
 arduino-cli compile --fqbn esp32:esp32:esp32dev ghost_device/
@@ -130,20 +141,55 @@ arduino-cli upload  --fqbn esp32:esp32:esp32dev --port /dev/cu.usbserial-* ghost
 
 ### 4. Verify
 
-Open Serial Monitor at **115200 baud**. Expected output:
+**LED (fastest check)**
 
+After flashing, watch the GPIO48 RGB LED:
+
+| LED | Meaning |
+|---|---|
+| Brief white flash | Init succeeded — tasks starting |
+| Cyan breathing | Running normally |
+| Blue flickering | Wi-Fi probe bursts firing (almost constant) |
+| Purple every 2.5 s | BLE identity rotating |
+| Solid red | Wi-Fi init failed — wrong board FQBN or missing flash size |
+
+Serial output is not available on the native USB port of ESP32-S3 dev boards without additional configuration. Use the LED as the primary indicator.
+
+**Wi-Fi probes (requires Linux + monitor-mode adapter)**
+
+```bash
+sudo iw wlan0 set type monitor
+sudo ip link set wlan0 up
+sudo tcpdump -i wlan0 'wlan type mgt subtype probe-req' -e
 ```
-ghost_device starting — 100 virtual devices, 1500 SSIDs
-Free heap: 284672 bytes
-Initialized 100 virtual devices, 1500 SSIDs loaded
-Wi-Fi injection ready
-BLE ghost ready
-Running. Free heap after init: 198432 bytes
+
+Look for locally-administered MACs (`02:xx`, `fe:xx`, `ee:xx`, etc.) sending 5–8 SSIDs in rapid 20 ms bursts. One burst appears roughly every 80–200 ms from a new virtual device MAC.
+
+Example output confirming ghost_device:
+```
+SA:ee:0b:f9:83:ef:8c  Probe Request (ATTWifi-2A3B)
+SA:ee:0b:f9:83:ef:8c  Probe Request (ATTWifi-C7D4)   ← 20 ms later
+SA:ee:0b:f9:83:ef:8c  Probe Request (ATT-WiFi-2G)    ← 20 ms later
+SA:ee:0b:f9:83:ef:8c  Probe Request (ATT-WiFi-5G)    ← 20 ms later
 ```
 
-On boards with an RGB LED, the cyan breathing heartbeat confirms the firmware is running before any wireless traffic appears.
+**BLE advertisements**
 
-In a Wi-Fi scanner (Kismet, airodump-ng) you should immediately see probe requests from locally-administered MACs. In a BLE scanner (nRF Connect, Wireshark + BT adapter) you should see advertisements cycling through device names like "iPhone 16 Pro", "Galaxy S25", "MacBook Air", etc.
+```bash
+pip install bleak
+python3 -c "
+import asyncio, bleak
+
+async def scan():
+    devs = await bleak.BleakScanner.discover(timeout=5.0)
+    for d in devs:
+        print(d.name, d.address, d.rssi)
+
+asyncio.run(scan())
+"
+```
+
+Look for device names like `iPhone 16 Pro`, `Galaxy S25`, `MacBook Air`, `THINKPAD-X1` cycling at -50 to -70 dBm.
 
 ## Configuration
 
