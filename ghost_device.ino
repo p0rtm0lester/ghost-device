@@ -22,6 +22,7 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 
 #include "wifi_probe.h"
 #include "ble_ghost.h"
@@ -29,6 +30,27 @@
 #include "ssid_list.h"
 
 static const char* TAG = "ghost";
+
+// ── RGB LED status ─────────────────────────────────────────────────────────────
+// Built-in WS2812B on GPIO48. Uses rgbLedWrite() from the ESP32 Arduino core —
+// no external library needed.
+//
+// Color key:
+//   Cyan breathing    idle / running normally
+//   Blue flash        Wi-Fi probe cycle complete (all 100 devices probed once)
+//   Purple flash      BLE identity rotated
+//   Yellow flash      Wildcard MAC rotated (30-second cadence)
+//   Green flash       Directed MACs rotated (10-minute cadence)
+
+#define LED_PIN RGB_BUILTIN
+
+// Non-blocking: set LED color. The heartbeat in loop() returns it to idle.
+static volatile uint8_t led_r = 0, led_g = 0, led_b = 0;
+
+static void led_set(uint8_t r, uint8_t g, uint8_t b) {
+    led_r = r; led_g = g; led_b = b;
+    rgbLedWrite(LED_PIN, r, g, b);
+}
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -91,6 +113,7 @@ static void gen_mac(uint8_t* mac) {
 static void rotate_directed_macs() {
     for (int i = 0; i < NUM_VIRTUAL_DEVICES; i++)
         gen_mac(devices[i].mac);
+    led_set(0, 40, 0);   // green flash — directed MAC rotation event
 }
 
 static void init_virtual_devices() {
@@ -134,11 +157,13 @@ static void wifi_probe_task(void* arg) {
         if (now - last_wildcard_rotate >= WILDCARD_MAC_ROTATE_MS) {
             gen_mac(wildcard_mac);
             last_wildcard_rotate = now;
+            led_set(40, 35, 0);   // yellow flash — wildcard MAC rotation
         }
 
         VirtualDevice& dev = devices[dev_idx];
 
-        // Directed probes for each SSID this device "remembers"
+        // Directed probes — blue flash on each device's burst
+        led_set(0, 0, 30);
         for (int s = 0; s < dev.ssid_count; s++) {
             int ssid_idx = (dev.ssid_start + s) % NUM_SSIDS;
             const char* ssid = ssid_list[ssid_idx];
@@ -165,6 +190,7 @@ static void ble_task(void* arg) {
 
     while (true) {
         ble_ghost_advertise(dev_idx);
+        led_set(30, 0, 40);   // purple flash — BLE identity rotated
         vTaskDelay(pdMS_TO_TICKS(BLE_ROTATE_MS));
         dev_idx = (dev_idx + 1) % NUM_VIRTUAL_DEVICES;
     }
@@ -205,11 +231,19 @@ void setup() {
 }
 
 void loop() {
-    static uint32_t last_ms = 0;
-    if (millis() - last_ms >= 30000) {
+    // Cyan breathing heartbeat — sine wave at ~0.5 Hz, dim so flashes stand out.
+    // The Wi-Fi and BLE tasks overwrite this with their event colors; the heartbeat
+    // pulls it back toward idle between events.
+    static float phase = 0.0f;
+    phase += 0.08f;
+    uint8_t b = (uint8_t)(6.0f + 10.0f * (0.5f + 0.5f * sinf(phase)));
+    rgbLedWrite(LED_PIN, 0, b / 3, b);
+
+    static uint32_t last_log_ms = 0;
+    if (millis() - last_log_ms >= 30000) {
         ESP_LOGI(TAG, "Heap: %lu bytes | Uptime: %lus",
                  esp_get_free_heap_size(), millis() / 1000UL);
-        last_ms = millis();
+        last_log_ms = millis();
     }
-    delay(1000);
+    delay(50);   // 20 Hz update for smooth breathing
 }
