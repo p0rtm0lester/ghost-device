@@ -7,8 +7,8 @@ Each virtual device has its own random MAC address and "knows" a set of nearby S
 ## What it does
 
 **Wi-Fi (802.11 probe requests)**
-- 100 virtual devices, each with a unique locally-administered MAC
-- Each device probes for 3–8 SSIDs drawn from a 1,500-entry list
+- 100 virtual devices, each with a unique locally-administered MAC (`02:xx:xx:xx:xx:xx`)
+- Each device probes for 3–8 SSIDs drawn from a 1,500-entry default list
 - Sends realistic 802.11n frames: SSID IE, Supported Rates, HT Capabilities, Extended Capabilities
 - Cycles through all 11 2.4 GHz channels
 - ~1/3 of devices also emit wildcard probes (empty SSID), as real phones do
@@ -20,16 +20,44 @@ Each virtual device has its own random MAC address and "knows" a set of nearby S
 - Sets Apple / Samsung / Microsoft manufacturer-specific data bytes
 - Non-connectable advertisements at 100–150 ms intervals
 
+**MAC randomization (iOS 14+ / Android 10+ behavior)**
+
+Modern phones use two independent MAC pools for probe requests — directed probes and wildcard probes use different addresses, and both rotate on different schedules. This firmware replicates that behavior exactly:
+
+| Probe type | MAC | Rotation |
+|---|---|---|
+| Directed (specific SSID) | Per-device MAC | Every 10 minutes |
+| Wildcard (empty SSID) | Shared, separate MAC | Every 30 seconds |
+| BLE advertisements | Per-identity random address | Every 2.5 seconds |
+
+Using a different MAC for wildcard vs. directed probes is the key behavior that defeats cross-session fingerprinting — a passive observer cannot correlate the two traffic types by MAC alone.
+
 ## Hardware
 
-| Board | Wi-Fi | BLE | Notes |
-|---|---|---|---|
-| ESP32 (original) | ✅ | ✅ | Tested |
-| ESP32-S3 | ✅ | ✅ | Tested — uses NimBLE stack |
-| ESP32-S2 | ✅ | ❌ | Wi-Fi only; comment out BLE init |
-| ESP32-C3 | ✅ | ✅ | Should work, untested |
+Tested on **ESP32-S3FH4R2** (4 MB flash, 2 MB PSRAM). Should work on any ESP32 variant with sufficient flash:
+
+| Board | Wi-Fi | BLE | RGB LED | Notes |
+|---|---|---|---|---|
+| ESP32-S3 Dev Module | ✅ | ✅ | ✅ GPIO48 | Primary test target |
+| ESP32 (original) | ✅ | ✅ | ❌ | No built-in RGB |
+| ESP32-S2 | ✅ | ❌ | ❌ | Wi-Fi only; comment out BLE init |
+| ESP32-C3 | ✅ | ✅ | ❌ | Untested |
 
 Minimum flash: 4 MB. No PSRAM required.
+
+## RGB LED status
+
+On boards with a built-in WS2812B RGB LED (GPIO48 on ESP32-S3 dev modules), the LED provides live activity feedback. No external library is needed — the firmware uses `rgbLedWrite()` from the ESP32 Arduino Core 3.x.
+
+| Color | Event |
+|---|---|
+| 🔵 Cyan, slow breathing | Idle — running normally |
+| 🔵 Blue | Wi-Fi probe burst firing |
+| 🟣 Purple | BLE identity rotated (every 2.5 s) |
+| 🟡 Yellow | Wildcard MAC rotated (every 30 s) |
+| 🟢 Green | All directed MACs rotated (every 10 min) |
+
+During normal operation the LED flickers blue constantly (probing is nearly continuous), with purple flashes every 2.5 seconds as BLE identities rotate. Yellow appears every 30 seconds and green appears every 10 minutes.
 
 ## Setup
 
@@ -79,6 +107,8 @@ python3 wigle_fetch.py \
     --output ../ssid_list.h
 ```
 
+The SSID list is stored in flash (not RAM), so it can be as large as your flash partition allows.
+
 ### 3. Flash
 
 **Arduino IDE**
@@ -89,13 +119,13 @@ python3 wigle_fetch.py \
 
 **arduino-cli**
 ```bash
-# ESP32 original
-arduino-cli compile --fqbn esp32:esp32:esp32dev ghost_device/
-arduino-cli upload  --fqbn esp32:esp32:esp32dev --port /dev/cu.usbserial-* ghost_device/
-
 # ESP32-S3
 arduino-cli compile --fqbn esp32:esp32:esp32s3 ghost_device/
 arduino-cli upload  --fqbn esp32:esp32:esp32s3 --port /dev/cu.usbmodem* ghost_device/
+
+# ESP32 original
+arduino-cli compile --fqbn esp32:esp32:esp32dev ghost_device/
+arduino-cli upload  --fqbn esp32:esp32:esp32dev --port /dev/cu.usbserial-* ghost_device/
 ```
 
 ### 4. Verify
@@ -111,7 +141,9 @@ BLE ghost ready
 Running. Free heap after init: 198432 bytes
 ```
 
-In a Wi-Fi scanner (Kismet, airodump-ng) you should immediately see probe requests from dozens of locally-administered MACs (`02:xx:xx:xx:xx:xx`). In a BLE scanner (nRF Connect, Wireshark) you should see advertisements rotating through device names like "iPhone 15 Pro", "Galaxy S25", "MacBook Air", etc.
+On boards with an RGB LED, the cyan breathing heartbeat confirms the firmware is running before any wireless traffic appears.
+
+In a Wi-Fi scanner (Kismet, airodump-ng) you should immediately see probe requests from locally-administered MACs. In a BLE scanner (nRF Connect, Wireshark + BT adapter) you should see advertisements cycling through device names like "iPhone 16 Pro", "Galaxy S25", "MacBook Air", etc.
 
 ## Configuration
 
@@ -120,19 +152,20 @@ All tuning constants are at the top of `ghost_device.ino`:
 | Constant | Default | Effect |
 |---|---|---|
 | `NUM_VIRTUAL_DEVICES` | `100` | Number of simultaneous device identities |
-| `PROBE_BURST_COUNT` | `3` | Directed probes per SSID per device cycle |
-| `PROBE_BURST_DELAY_MS` | `20` | Ms between probes in a burst |
-| `PROBE_DEVICE_DELAY_MS` | `80` | Ms before cycling to the next device |
-| `BLE_ROTATE_MS` | `2500` | Ms each BLE identity is held before rotating |
+| `PROBE_BURST_DELAY_MS` | `20` | ms between probes in a burst |
+| `PROBE_DEVICE_DELAY_MS` | `80` | ms before cycling to the next device |
+| `BLE_ROTATE_MS` | `2500` | ms per BLE identity |
+| `DIRECTED_MAC_ROTATE_MS` | `600000` | ms between directed MAC rotations (10 min) |
+| `WILDCARD_MAC_ROTATE_MS` | `30000` | ms between wildcard MAC rotations (30 s) |
 
-**More aggressive** (denser traffic, higher CPU):
+**More aggressive** (denser traffic):
 
 ```cpp
 #define PROBE_DEVICE_DELAY_MS   40
 #define BLE_ROTATE_MS           1000
 ```
 
-**Lower power** (thinner traffic):
+**Lower profile** (thinner traffic, less CPU):
 
 ```cpp
 #define NUM_VIRTUAL_DEVICES     50
@@ -142,7 +175,7 @@ All tuning constants are at the top of `ghost_device.ino`:
 
 ## Device mix
 
-Edit `device_profiles.h` to change the device type distribution:
+Edit `device_profiles.h` to change the simulated device distribution:
 
 ```cpp
 const uint8_t DTYPE_WEIGHTS[] = {
@@ -154,24 +187,19 @@ const uint8_t DTYPE_WEIGHTS[] = {
 };
 ```
 
-Add new device names to `DEVICE_NAMES[]` or new manufacturer data blobs to `MFR_DATA_BY_TYPE[]`.
-
-## MAC address behavior
-
-- **Wi-Fi MACs**: 100 locally-administered MACs (`02:xx:xx:xx:xx:xx`) generated at boot using the ESP32 hardware RNG. Fixed for the session; new MACs on each power cycle.
-- **BLE MACs**: New random static address generated for each identity rotation (every `BLE_ROTATE_MS`).
+Add device names to `DEVICE_NAMES[]` or new manufacturer-specific data payloads to `MFR_DATA_BY_TYPE[]`.
 
 ## Project structure
 
 ```
 ghost_device/
-├── ghost_device.ino      Main sketch — device registry, task scheduling
+├── ghost_device.ino      Main sketch — device registry, MAC rotation, LED, task scheduling
 ├── wifi_probe.h/.cpp     802.11 probe request frame builder and injector
-├── ble_ghost.h/.cpp      BLE advertiser with rotating random addresses
+├── ble_ghost.h/.cpp      BLE advertiser with rotating random static addresses
 ├── device_profiles.h     Device names, BLE manufacturer data, type weights
 ├── ssid_list.h           SSID list stored in flash (1,500 entries default)
 └── tools/
-    └── wigle_fetch.py    Build ssid_list.h from WiGLE API, CSV, or generation
+    └── wigle_fetch.py    Build ssid_list.h from WiGLE API, CSV, or synthetic generation
 ```
 
 ## Legal notice
