@@ -23,6 +23,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <math.h>
+#include <stdarg.h>
+
+// Route ESP_LOG output to USB CDC serial (CDCOnBoot build) so boot messages
+// appear on the USB serial monitor without a hardware UART adapter.
+static int serial_vprintf(const char* fmt, va_list args) {
+    char buf[256];
+    int n = vsnprintf(buf, sizeof(buf), fmt, args);
+    Serial.print(buf);
+    return n;
+}
 
 #include "wifi_probe.h"
 #include "ble_ghost.h"
@@ -200,7 +210,9 @@ static void ble_task(void* arg) {
 
 void setup() {
     Serial.begin(115200);
-    delay(500);
+    delay(300);
+    esp_log_set_vprintf(serial_vprintf);
+    esp_log_level_set("*", ESP_LOG_INFO);
 
     ESP_LOGI(TAG, "ghost_device starting — %d virtual devices, %d SSIDs",
              NUM_VIRTUAL_DEVICES, NUM_SSIDS);
@@ -217,11 +229,15 @@ void setup() {
 
     if (!wifi_inject_init()) {
         ESP_LOGE(TAG, "Wi-Fi init failed, halting");
-        while (true) delay(1000);
+        // Solid red = Wi-Fi init failure — check serial log for error code
+        while (true) { rgbLedWrite(LED_PIN, 60, 0, 0); delay(1000); }
     }
 
     if (!ble_ghost_init())
         ESP_LOGW(TAG, "BLE init failed — running Wi-Fi only");
+
+    // Brief white flash = all init succeeded, tasks starting
+    led_set(40, 40, 40); delay(200); led_set(0, 0, 0);
 
     // Wi-Fi task on core 0, BLE task on core 1
     xTaskCreatePinnedToCore(wifi_probe_task, "wifi_probe", 8192, nullptr, 5, nullptr, 0);

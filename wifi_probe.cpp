@@ -1,6 +1,7 @@
 #include "wifi_probe.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include <string.h>
 
@@ -53,6 +54,10 @@ static const uint8_t IE_EXT_CAP[] = {
 // ── Public API ─────────────────────────────────────────────────────────────────
 
 bool wifi_inject_init() {
+    // netif must be initialized before esp_wifi_init in ESP-IDF v5+
+    esp_netif_init();
+    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_wifi_init(&cfg);
     if (ret != ESP_OK) {
