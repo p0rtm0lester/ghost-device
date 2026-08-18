@@ -42,6 +42,19 @@ static const char* TAG = "ghost";
 // BLE rotation: how long each virtual device "exists" before swapping identity
 #define BLE_ROTATE_MS           2500  // ms per BLE identity (2.5 seconds)
 
+// MAC rotation — mirrors iOS 14+ / Android 10+ behavior:
+//
+//   Directed probes (specific SSID) use a per-device MAC that is stable within
+//   a scan session, then rotates.  iOS rotates these roughly every 5–15 min
+//   when actively scanning; 10 min is a realistic middle value.
+//
+//   Wildcard probes (empty SSID) use a *separate* MAC that rotates much more
+//   aggressively — iOS changes it every 30–60 seconds of active scanning.
+//   Using a different MAC for wildcards vs. directed probes is the key behavior
+//   that defeats cross-session fingerprinting.
+#define DIRECTED_MAC_ROTATE_MS  (10UL * 60UL * 1000UL)  // 10 minutes
+#define WILDCARD_MAC_ROTATE_MS  (       30UL * 1000UL)  // 30 seconds
+
 // 802.11 channels to cycle through (1–11 = 2.4 GHz)
 static const uint8_t CHANNELS[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
 #define NUM_CHANNELS (sizeof(CHANNELS) / sizeof(CHANNELS[0]))
@@ -49,7 +62,7 @@ static const uint8_t CHANNELS[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
 // ── Virtual Device Registry ────────────────────────────────────────────────────
 
 struct VirtualDevice {
-    uint8_t mac[6];        // Wi-Fi source MAC (locally administered, random per boot)
+    uint8_t mac[6];        // Wi-Fi MAC for directed probes (rotates every DIRECTED_MAC_ROTATE_MS)
     uint8_t ssid_start;    // first index into ssid_list[] for this device
     uint8_t ssid_count;    // how many SSIDs this device "knows" (3–8)
     uint8_t channel;       // preferred probe channel
@@ -57,11 +70,15 @@ struct VirtualDevice {
 
 static VirtualDevice devices[NUM_VIRTUAL_DEVICES];
 
+// Separate MAC used exclusively for wildcard (empty SSID) probes.
+// Kept distinct from directed-probe MACs — real phones do the same.
+static uint8_t wildcard_mac[6];
+
 // Generates a random locally-administered unicast MAC.
 // Bit 0 of byte 0 = 0 (unicast), bit 1 of byte 0 = 1 (locally administered).
-static void gen_mac(int index, uint8_t* mac) {
+static void gen_mac(uint8_t* mac) {
     uint32_t r1 = esp_random();
-    uint32_t r2 = esp_random() ^ ((uint32_t)index * 2654435761UL);
+    uint32_t r2 = esp_random();
     mac[0] = (r1 & 0xfe) | 0x02;
     mac[1] = (r1 >>  8) & 0xff;
     mac[2] = (r1 >> 16) & 0xff;
@@ -70,15 +87,21 @@ static void gen_mac(int index, uint8_t* mac) {
     mac[5] = (r2 >> 16) & 0xff;
 }
 
-static void init_virtual_devices() {
-    for (int i = 0; i < NUM_VIRTUAL_DEVICES; i++) {
-        gen_mac(i, devices[i].mac);
+// Rotate all directed-probe MACs (called at boot and every DIRECTED_MAC_ROTATE_MS).
+static void rotate_directed_macs() {
+    for (int i = 0; i < NUM_VIRTUAL_DEVICES; i++)
+        gen_mac(devices[i].mac);
+}
 
+static void init_virtual_devices() {
+    rotate_directed_macs();
+    gen_mac(wildcard_mac);
+
+    for (int i = 0; i < NUM_VIRTUAL_DEVICES; i++) {
         devices[i].ssid_count = 3 + (esp_random() % 6);
         devices[i].ssid_start = (i * (NUM_SSIDS / NUM_VIRTUAL_DEVICES)) % NUM_SSIDS;
         if (devices[i].ssid_start + devices[i].ssid_count > NUM_SSIDS)
             devices[i].ssid_start = NUM_SSIDS - devices[i].ssid_count;
-
         devices[i].channel = CHANNELS[i % NUM_CHANNELS];
     }
     ESP_LOGI(TAG, "Initialized %d virtual devices, %d SSIDs loaded",
@@ -88,13 +111,34 @@ static void init_virtual_devices() {
 // ── Wi-Fi Probe Task ───────────────────────────────────────────────────────────
 
 static void wifi_probe_task(void* arg) {
-    int dev_idx     = 0;
-    int channel_idx = 0;
+    int      dev_idx              = 0;
+    int      channel_idx          = 0;
+    uint32_t last_directed_rotate = 0;
+    uint32_t last_wildcard_rotate = 0;
 
     while (true) {
+        uint32_t now = millis();
+
+        // Rotate directed-probe MACs every DIRECTED_MAC_ROTATE_MS.
+        // Real phones (iOS 14+, Android 10+) rotate per-network MACs on this
+        // cadence to prevent cross-session tracking.
+        if (now - last_directed_rotate >= DIRECTED_MAC_ROTATE_MS) {
+            rotate_directed_macs();
+            last_directed_rotate = now;
+            ESP_LOGI(TAG, "Directed MACs rotated");
+        }
+
+        // Rotate wildcard MAC every WILDCARD_MAC_ROTATE_MS.
+        // Wildcard probes use a completely separate, faster-rotating MAC —
+        // the same separation real phones make between scanning and directed traffic.
+        if (now - last_wildcard_rotate >= WILDCARD_MAC_ROTATE_MS) {
+            gen_mac(wildcard_mac);
+            last_wildcard_rotate = now;
+        }
+
         VirtualDevice& dev = devices[dev_idx];
 
-        // Send directed probes for each SSID this device "remembers"
+        // Directed probes for each SSID this device "remembers"
         for (int s = 0; s < dev.ssid_count; s++) {
             int ssid_idx = (dev.ssid_start + s) % NUM_SSIDS;
             const char* ssid = ssid_list[ssid_idx];
@@ -102,10 +146,10 @@ static void wifi_probe_task(void* arg) {
             vTaskDelay(pdMS_TO_TICKS(PROBE_BURST_DELAY_MS));
         }
 
-        // ~1/3 of devices also send a wildcard probe (empty SSID), like most real phones
+        // ~1/3 of devices also send a wildcard probe using the dedicated wildcard MAC
         if ((dev_idx % 3) == 0) {
             uint8_t hop = CHANNELS[channel_idx % NUM_CHANNELS];
-            wifi_send_probe_request(dev.mac, nullptr, 0, hop);
+            wifi_send_probe_request(wildcard_mac, nullptr, 0, hop);
             channel_idx++;
         }
 
